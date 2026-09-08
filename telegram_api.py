@@ -2,9 +2,13 @@
 """Тонкая обёртка над Telegram Bot API (long polling), без сторонних
 фреймворков — используется только `requests`, чтобы не зависеть от пакетов,
 которые могут быть недоступны для установки."""
+import logging
+
 import requests
 
 API_ROOT = "https://api.telegram.org"
+
+log = logging.getLogger("trainer_bot.api")
 
 
 class TelegramAPI:
@@ -32,11 +36,53 @@ class TelegramAPI:
             params["reply_markup"] = reply_markup
         return self._call("sendMessage", **params)
 
+    def edit_message_text(
+        self, chat_id: int, message_id: int, text: str, reply_markup: dict | None = None
+    ):
+        """Меняет текст и кнопки уже отправленного сообщения.
+
+        Возвращает False, если отредактировать не удалось (сообщение слишком
+        старое, удалено пользователем и т.п.) — вызывающий код тогда шлёт новое.
+        Повтор того же текста Telegram считает ошибкой «message is not
+        modified» — её глушим отдельно, это не проблема.
+        """
+        params = {"chat_id": chat_id, "message_id": message_id, "text": text}
+        params["reply_markup"] = reply_markup if reply_markup is not None else {"inline_keyboard": []}
+        try:
+            self._call("editMessageText", **params)
+            return True
+        except Exception as e:
+            if "message is not modified" in str(e):
+                return True
+            log.info("Не удалось отредактировать сообщение %s: %s", message_id, e)
+            return False
+
+    def delete_message(self, chat_id: int, message_id: int) -> bool:
+        """Удаляет сообщение. Ошибки не считаются фатальными: Telegram не даёт
+        удалять сообщения старше 48 часов и часть чужих сообщений."""
+        try:
+            self._call("deleteMessage", chat_id=chat_id, message_id=message_id)
+            return True
+        except Exception as e:
+            log.info("Не удалось удалить сообщение %s: %s", message_id, e)
+            return False
+
     def answer_callback_query(self, callback_query_id: str, text: str | None = None):
         params = {"callback_query_id": callback_query_id}
         if text:
             params["text"] = text
         return self._call("answerCallbackQuery", **params)
+
+    def set_my_commands(self, commands: list):
+        """commands: список (команда, описание) — показывается в меню Telegram."""
+        return self._call(
+            "setMyCommands",
+            commands=[{"command": c, "description": d} for c, d in commands],
+        )
+
+    def set_chat_menu_button(self):
+        """Кнопка «Меню» в чате открывает список команд."""
+        return self._call("setChatMenuButton", menu_button={"type": "commands"})
 
     def get_me(self):
         return self._call("getMe")

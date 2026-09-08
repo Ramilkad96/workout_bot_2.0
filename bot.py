@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Telegram-бот «Тренер» — пользователь пошагово составляет свою программу
-тренировок, тренируется по ней, логирует подходы и получает сводку по
-завершению тренировки.
+тренировок, тренируется по ней (вес и повторения по каждому подходу) и
+получает сводку по завершению тренировки.
 
 Запуск:
     1. Получить токен у @BotFather в Telegram.
@@ -13,37 +13,40 @@ Telegram-бот «Тренер» — пользователь пошагово �
 import logging
 import time
 
+import catalog
+import editor
 import wizard
+import workout
 from config import BOT_TOKEN, DB_PATH
-from program import MAX_SETS, format_program, plural_sets, day_title
+from program import MAX_SETS, day_title, format_program
 from storage import Storage
 from telegram_api import TelegramAPI, inline_keyboard
-from workout import (
-    new_session_state,
-    current_exercise,
-    record_sets,
-    skip_exercise,
-    is_finished,
-    build_summary,
-    parse_sets_input,
-    SetParseError,
-)
-import catalog
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("trainer_bot")
 
+COMMANDS = [
+    ("train", "Начать тренировку"),
+    ("program", "Моя программа"),
+    ("edit", "Редактировать программу"),
+    ("newprogram", "Составить программу заново"),
+    ("help", "Как пользоваться ботом"),
+    ("cancel", "Отменить текущее действие"),
+]
+
 HELP_TEXT = (
     "Я помогу тренироваться по твоей собственной программе.\n\n"
-    "📝 /newprogram — составить программу тренировок. Бот проведёт по шагам:\n"
+    "📝 /newprogram — составить программу по шагам:\n"
     "   • сколько тренировочных дней в неделю;\n"
-    "   • комментарий к каждому дню (какая группа мышц);\n"
+    "   • название каждого дня (группа мышц, «Фулбади», день недели "
+    "или просто номер);\n"
     "   • упражнения — из каталога или своим названием;\n"
     "   • сколько подходов в каждом упражнении.\n\n"
-    "📋 /program — посмотреть сохранённую программу.\n"
-    "🏋️ /train — начать тренировку: выбрать день и записывать фактические "
-    "подходы (например: 80x8, 80x8, 75x6).\n"
-    "📊 В конце тренировки бот пришлёт сводку: тоннаж, подходы, повторения, время.\n\n"
+    "📋 /program — посмотреть программу.\n"
+    "✏️ /edit — изменить программу: дни, упражнения, подходы.\n"
+    "🏋️ /train — тренировка: выбираешь упражнение в любом порядке и на "
+    "каждый подход вводишь вес, затем повторения.\n"
+    "📊 В конце — сводка по тренировке.\n\n"
     "❌ /cancel — отменить текущее действие."
 )
 
@@ -53,7 +56,7 @@ class TrainerBot:
         self.api = api
         self.storage = storage
 
-    # ---------- точка входа ----------
+    # ---------- служебное ----------
     def handle_update(self, update: dict):
         try:
             if "message" in update:
@@ -63,9 +66,34 @@ class TrainerBot:
         except Exception:
             log.exception("Ошибка при обработке update: %s", update)
 
-    def _send_screen(self, chat_id: int, screen: tuple):
-        text, keyboard = screen
-        self.api.send_message(chat_id, text, reply_markup=keyboard)
+    def _render(self, chat_id: int, state: dict, screen: tuple):
+        """Показывает экран: правит уже отправленное сообщение, если возможно,
+        иначе шлёт новое. За счёт этого чат не засоряется клавиатурами."""
+        text, markup = screen
+        msg_id = state.get("msg_id")
+        if msg_id and self.api.edit_message_text(chat_id, msg_id, text, markup):
+            return
+        result = self.api.send_message(chat_id, text, reply_markup=markup)
+        state["msg_id"] = result.get("message_id")
+
+    def _render_error(self, chat_id: int, state: dict, screen: tuple, error: str):
+        """Ошибка ввода показывается прямо в экране, а не отдельным сообщением —
+        иначе клавиатура уезжает вверх и чат засоряется."""
+        text, markup = screen
+        self._render(chat_id, state, (f"⚠️ {error}\n\n{text}", markup))
+
+    def _drop_screen(self, chat_id: int, state: dict):
+        """Убирает сообщение-экран (перед финальным сообщением)."""
+        msg_id = state.get("msg_id")
+        if msg_id:
+            self.api.delete_message(chat_id, msg_id)
+            state["msg_id"] = None
+
+    def _cleanup_user_message(self, chat_id: int, message: dict):
+        """Удаляет введённое пользователем значение — чат остаётся чистым."""
+        message_id = message.get("message_id")
+        if message_id:
+            self.api.delete_message(chat_id, message_id)
 
     # ---------- сообщения ----------
     def _handle_message(self, message: dict):
@@ -77,201 +105,320 @@ class TrainerBot:
         self.storage.ensure_user(user_id, user.get("username"))
         session = self.storage.get_session(user_id)
 
-        if text.startswith("/start"):
-            self.storage.clear_session(user_id)
-            self.api.send_message(chat_id, "Привет! " + HELP_TEXT)
-            return
-
-        if text.startswith("/help"):
-            self.api.send_message(chat_id, HELP_TEXT)
-            return
-
-        if text.startswith("/cancel"):
-            self.storage.clear_session(user_id)
-            self.api.send_message(chat_id, "Действие отменено.")
-            return
-
-        if text.startswith("/newprogram"):
-            self._start_wizard(chat_id, user_id)
-            return
-
-        if text.startswith("/program"):
-            program = self.storage.get_program(user_id)
-            if not program:
-                self.api.send_message(
-                    chat_id, "Программа ещё не создана. Составить — /newprogram"
-                )
-            else:
-                self.api.send_message(chat_id, format_program(program))
-            return
-
-        if text.startswith("/train"):
-            self._start_train(chat_id, user_id)
+        if text.startswith("/"):
+            self._handle_command(chat_id, user_id, text, session)
             return
 
         state_name = session["state"]
         if state_name == "wizard":
-            self._handle_wizard_text(chat_id, user_id, session["data"], text)
+            self._wizard_text(chat_id, user_id, session["data"], text, message)
+            return
+        if state_name == "editor":
+            self._editor_text(chat_id, user_id, session["data"], text, message)
             return
         if state_name == "logging":
-            self._handle_set_input(chat_id, user_id, session["data"], text)
+            self._workout_text(chat_id, user_id, session["data"], text, message)
             return
 
-        self.api.send_message(chat_id, "Не понял команду. Список команд — /help")
+        self.api.send_message(chat_id, "Не понял. Список команд — /help")
+
+    def _handle_command(self, chat_id: int, user_id: int, text: str, session: dict):
+        command = text.split()[0].split("@")[0]
+
+        if command == "/start":
+            self.storage.clear_session(user_id)
+            self.api.send_message(chat_id, "Привет! " + HELP_TEXT)
+            return
+        if command == "/help":
+            self.api.send_message(chat_id, HELP_TEXT)
+            return
+        if command == "/cancel":
+            self._drop_screen(chat_id, session["data"])
+            self.storage.clear_session(user_id)
+            self.api.send_message(chat_id, "Действие отменено.")
+            return
+        if command == "/newprogram":
+            self._start_wizard(chat_id, user_id)
+            return
+        if command == "/program":
+            program = self.storage.get_program(user_id)
+            if not program:
+                self.api.send_message(chat_id, "Программа ещё не создана. Составить — /newprogram")
+            else:
+                self.api.send_message(
+                    chat_id,
+                    format_program(program),
+                    reply_markup=inline_keyboard([[("✏️ Редактировать", "t:edit")]]),
+                )
+            return
+        if command == "/edit":
+            self._start_editor(chat_id, user_id)
+            return
+        if command == "/train":
+            self._start_train(chat_id, user_id)
+            return
+
+        self.api.send_message(chat_id, "Такой команды нет. Список команд — /help")
 
     # ---------- мастер создания программы ----------
     def _start_wizard(self, chat_id: int, user_id: int):
         state = wizard.new_state()
-        self.storage.set_session(user_id, "wizard", state)
         if self.storage.get_program(user_id):
             self.api.send_message(
                 chat_id,
                 "Составляем новую программу. Текущая программа будет заменена "
-                "только после того, как мастер дойдёт до конца.",
+                "только после того, как мастер дойдёт до конца.\n"
+                "Изменить существующую — /edit",
             )
-        self._send_screen(chat_id, wizard.screen_days_count())
+        self._render(chat_id, state, wizard.screen_days_count())
+        self.storage.set_session(user_id, "wizard", state)
 
-    def _handle_wizard_text(self, chat_id: int, user_id: int, state: dict, text: str):
+    def _wizard_text(self, chat_id: int, user_id: int, state: dict, text: str, message: dict):
         step = state["step"]
+        self._cleanup_user_message(chat_id, message)
 
         if step == wizard.STEP_DAY_COMMENT:
             wizard.set_day_comment(state, text)
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_pick_group(state))
-            return
-
-        if step == wizard.STEP_CUSTOM_EXERCISE:
-            name = text.strip()
-            if not name or name.startswith("/"):
-                self.api.send_message(chat_id, "Название не распознал, напишите ещё раз.")
+            self._render(chat_id, state, wizard.screen_pick_group(state))
+        elif step == wizard.STEP_CUSTOM_EXERCISE:
+            name = text.strip()[:100]
+            if not name:
                 return
-            state["pending_exercise"] = name[:100]
+            state["pending_exercise"] = name
             state["step"] = wizard.STEP_SETS
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_sets(state["pending_exercise"]))
-            return
-
-        if step == wizard.STEP_CUSTOM_SETS:
-            try:
-                sets = int(text.strip())
-            except ValueError:
-                self.api.send_message(chat_id, f"Нужно число от 1 до {MAX_SETS}.")
-                return
-            if not 1 <= sets <= MAX_SETS:
-                self.api.send_message(chat_id, f"Нужно число от 1 до {MAX_SETS}.")
+            self._render(chat_id, state, wizard.screen_sets(name))
+        elif step == wizard.STEP_CUSTOM_SETS:
+            sets = self._parse_sets(text)
+            if sets is None:
+                self._render_error(
+                    chat_id, state, wizard.screen_custom_sets(),
+                    f"Нужно число от 1 до {MAX_SETS}.",
+                )
+                self.storage.set_session(user_id, "wizard", state)
                 return
             wizard.add_exercise(state, state["pending_exercise"], sets)
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_day_menu(state))
+            self._render(chat_id, state, wizard.screen_day_menu(state))
+        else:
             return
+        self.storage.set_session(user_id, "wizard", state)
 
-        if step == wizard.STEP_DAYS_COUNT:
-            self.api.send_message(chat_id, "Выберите количество дней кнопкой выше.")
-            return
-
-        self.api.send_message(chat_id, "Продолжим — нажмите кнопку в сообщении выше.")
-
-    def _handle_wizard_callback(self, chat_id: int, user_id: int, state: dict, data: str) -> str | None:
-        """Возвращает текст всплывающего ответа на callback (или None)."""
+    def _wizard_callback(self, chat_id: int, user_id: int, state: dict, data: str) -> str | None:
         parts = data.split(":")
         action = parts[1] if len(parts) > 1 else ""
 
         if action == "dc":
-            count = int(parts[2])
-            wizard.set_days_count(state, count)
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_after_days_count(state))
-            self._send_screen(chat_id, wizard.screen_day_comment(state))
-            return None
-
-        if action == "nocom":
+            wizard.set_days_count(state, int(parts[2]))
+            self._render(chat_id, state, wizard.screen_day_comment(state))
+        elif action == "nocom":
             wizard.set_day_comment(state, "")
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_pick_group(state))
-            return None
-
-        if action == "grp":
+            self._render(chat_id, state, wizard.screen_pick_group(state))
+        elif action == "grp":
             group_index = int(parts[2])
             if not catalog.is_valid(group_index):
                 return "Группа не найдена"
             state["group_index"] = group_index
             state["step"] = wizard.STEP_PICK_EXERCISE
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_pick_exercise(group_index))
-            return None
-
-        if action == "groups":
+            self._render(chat_id, state, wizard.screen_pick_exercise(group_index))
+        elif action == "groups":
             state["step"] = wizard.STEP_PICK_GROUP
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_pick_group(state))
-            return None
-
-        if action == "ex":
+            self._render(chat_id, state, wizard.screen_pick_group(state))
+        elif action == "ex":
             group_index, exercise_index = int(parts[2]), int(parts[3])
             if not catalog.is_valid(group_index, exercise_index):
                 return "Упражнение не найдено"
             state["pending_exercise"] = catalog.exercise_name(group_index, exercise_index)
             state["step"] = wizard.STEP_SETS
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_sets(state["pending_exercise"]))
-            return None
-
-        if action == "own":
+            self._render(chat_id, state, wizard.screen_sets(state["pending_exercise"]))
+        elif action == "own":
             state["step"] = wizard.STEP_CUSTOM_EXERCISE
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_custom_exercise())
-            return None
-
-        if action == "sets":
-            sets = int(parts[2])
+            self._render(chat_id, state, wizard.screen_custom_exercise())
+        elif action == "sets":
             if not state.get("pending_exercise"):
                 return "Сначала выберите упражнение"
-            wizard.add_exercise(state, state["pending_exercise"], sets)
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_day_menu(state))
-            return None
-
-        if action == "setsx":
+            wizard.add_exercise(state, state["pending_exercise"], int(parts[2]))
+            self._render(chat_id, state, wizard.screen_day_menu(state))
+        elif action == "setsx":
             state["step"] = wizard.STEP_CUSTOM_SETS
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_custom_sets())
-            return None
-
-        if action == "more":
+            self._render(chat_id, state, wizard.screen_custom_sets())
+        elif action == "more":
             state["step"] = wizard.STEP_PICK_GROUP
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_pick_group(state))
-            return None
-
-        if action == "undo":
+            self._render(chat_id, state, wizard.screen_pick_group(state))
+        elif action == "undo":
             removed = wizard.remove_last_exercise(state)
-            self.storage.set_session(user_id, "wizard", state)
-            self._send_screen(chat_id, wizard.screen_day_menu(state))
-            return None if removed else "Удалять нечего"
-
-        if action == "dayend":
-            day = wizard.current_day(state)
-            if not day["exercises"]:
+            self._render(chat_id, state, wizard.screen_day_menu(state))
+            if not removed:
+                self.storage.set_session(user_id, "wizard", state)
+                return "Удалять нечего"
+        elif action == "dayend":
+            if not wizard.current_day(state)["exercises"]:
                 return "Добавьте хотя бы одно упражнение"
             if wizard.finish_day(state):
-                self.storage.set_session(user_id, "wizard", state)
-                self._send_screen(chat_id, wizard.screen_day_comment(state))
+                self._render(chat_id, state, wizard.screen_day_comment(state))
             else:
                 self._finish_wizard(chat_id, user_id, state)
+                return None
+        else:
             return None
 
+        self.storage.set_session(user_id, "wizard", state)
         return None
 
     def _finish_wizard(self, chat_id: int, user_id: int, state: dict):
         program = wizard.build_program(state)
         self.storage.save_program(user_id, program, "")
+        self._drop_screen(chat_id, state)
         self.storage.clear_session(user_id)
         self.api.send_message(
             chat_id,
-            "Программа сохранена! 🎉\n\n"
-            + format_program(program)
-            + "\n\nНачать тренировку — /train",
+            "Программа сохранена! 🎉\n\n" + format_program(program),
+            reply_markup=inline_keyboard(
+                [[("🏋️ Начать тренировку", "t:again")], [("✏️ Редактировать", "t:edit")]]
+            ),
         )
+
+    # ---------- редактор программы ----------
+    def _start_editor(self, chat_id: int, user_id: int):
+        program = self.storage.get_program(user_id)
+        if not program:
+            self.api.send_message(chat_id, "Программа ещё не создана. Составить — /newprogram")
+            return
+        state = editor.new_state(program)
+        self._render(chat_id, state, editor.screen_days(state))
+        self.storage.set_session(user_id, "editor", state)
+
+    def _editor_save(self, user_id: int, state: dict):
+        self.storage.save_program(user_id, state["program"], "")
+        self.storage.set_session(user_id, "editor", state)
+
+    def _editor_text(self, chat_id: int, user_id: int, state: dict, text: str, message: dict):
+        view = state["view"]
+        self._cleanup_user_message(chat_id, message)
+
+        if view == editor.VIEW_RENAME_DAY:
+            editor.rename_day(state, text)
+            self._render(chat_id, state, editor.screen_day(state))
+        elif view == editor.VIEW_CUSTOM_EXERCISE:
+            name = text.strip()[:100]
+            if not name:
+                return
+            state["pending_exercise"] = name
+            state["view"] = editor.VIEW_SETS
+            self._render(chat_id, state, editor.screen_sets(name))
+        elif view == editor.VIEW_CUSTOM_SETS:
+            sets = self._parse_sets(text)
+            if sets is None:
+                self._render_error(
+                    chat_id, state, editor.screen_custom_sets(),
+                    f"Нужно число от 1 до {MAX_SETS}.",
+                )
+                self._editor_save(user_id, state)
+                return
+            self._editor_apply_sets(chat_id, state, sets)
+        else:
+            return
+        self._editor_save(user_id, state)
+
+    def _editor_apply_sets(self, chat_id: int, state: dict, sets: int):
+        """Подходы задаются и при добавлении упражнения, и при его правке."""
+        if state.get("pending_exercise"):
+            editor.add_exercise(state, state["pending_exercise"], sets)
+            self._render(chat_id, state, editor.screen_day(state))
+        else:
+            editor.change_sets(state, sets)
+            self._render(chat_id, state, editor.screen_exercise(state))
+
+    def _editor_callback(self, chat_id: int, user_id: int, state: dict, data: str) -> str | None:
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "days":
+            state["view"] = editor.VIEW_DAYS
+            state["day"] = None
+            self._render(chat_id, state, editor.screen_days(state))
+        elif action == "day":
+            if len(parts) > 2:
+                state["day"] = int(parts[2])
+            state["view"] = editor.VIEW_DAY
+            state["exercise"] = None
+            state["pending_exercise"] = ""
+            if editor.current_day(state) is None:
+                state["view"] = editor.VIEW_DAYS
+                self._render(chat_id, state, editor.screen_days(state))
+                return "День не найден"
+            self._render(chat_id, state, editor.screen_day(state))
+        elif action == "adday":
+            if not editor.add_day(state):
+                return "Больше дней добавить нельзя"
+            self._render(chat_id, state, editor.screen_day(state))
+        elif action == "delday":
+            if not editor.delete_day(state):
+                return "Нельзя удалить последний день"
+            self._render(chat_id, state, editor.screen_days(state))
+        elif action == "rename":
+            state["view"] = editor.VIEW_RENAME_DAY
+            self._render(chat_id, state, editor.screen_rename_day(state))
+        elif action == "ex":
+            state["exercise"] = int(parts[2])
+            state["view"] = editor.VIEW_EXERCISE
+            self._render(chat_id, state, editor.screen_exercise(state))
+        elif action == "addex":
+            state["pending_exercise"] = ""
+            state["view"] = editor.VIEW_PICK_GROUP
+            self._render(chat_id, state, editor.screen_pick_group(state))
+        elif action == "grp":
+            group_index = int(parts[2])
+            if not catalog.is_valid(group_index):
+                return "Группа не найдена"
+            state["group_index"] = group_index
+            state["view"] = editor.VIEW_PICK_EXERCISE
+            self._render(chat_id, state, editor.screen_pick_exercise(group_index))
+        elif action == "groups":
+            state["view"] = editor.VIEW_PICK_GROUP
+            self._render(chat_id, state, editor.screen_pick_group(state))
+        elif action == "exsel":
+            group_index, exercise_index = int(parts[2]), int(parts[3])
+            if not catalog.is_valid(group_index, exercise_index):
+                return "Упражнение не найдено"
+            state["pending_exercise"] = catalog.exercise_name(group_index, exercise_index)
+            state["view"] = editor.VIEW_SETS
+            self._render(chat_id, state, editor.screen_sets(state["pending_exercise"]))
+        elif action == "own":
+            state["view"] = editor.VIEW_CUSTOM_EXERCISE
+            self._render(chat_id, state, editor.screen_custom_exercise())
+        elif action == "setsedit":
+            state["pending_exercise"] = ""
+            day = editor.current_day(state)
+            title = day["exercises"][state["exercise"]]["name"]
+            state["view"] = editor.VIEW_SETS
+            self._render(chat_id, state, editor.screen_sets(title))
+        elif action == "sets":
+            self._editor_apply_sets(chat_id, state, int(parts[2]))
+        elif action == "setsx":
+            state["view"] = editor.VIEW_CUSTOM_SETS
+            self._render(chat_id, state, editor.screen_custom_sets())
+        elif action == "delex":
+            editor.delete_exercise(state)
+            self._render(chat_id, state, editor.screen_day(state))
+        elif action in ("up", "down"):
+            if not editor.move_exercise(state, -1 if action == "up" else 1):
+                return "Дальше двигать некуда"
+            self._render(chat_id, state, editor.screen_exercise(state))
+        elif action == "done":
+            program = state["program"]
+            self.storage.save_program(user_id, program, "")
+            self._drop_screen(chat_id, state)
+            self.storage.clear_session(user_id)
+            self.api.send_message(
+                chat_id,
+                "Программа сохранена ✅\n\n" + format_program(program),
+                reply_markup=inline_keyboard([[("🏋️ Начать тренировку", "t:again")]]),
+            )
+            return None
+        else:
+            return None
+
+        self._editor_save(user_id, state)
+        return None
 
     # ---------- тренировка ----------
     def _start_train(self, chat_id: int, user_id: int):
@@ -280,91 +427,163 @@ class TrainerBot:
             self.api.send_message(chat_id, "Сначала составьте программу — /newprogram")
             return
         buttons = [
-            [(day_title(day), f"train_day:{i}")] for i, day in enumerate(program["days"])
+            [(day_title(day), f"t:day:{i}")] for i, day in enumerate(program["days"])
         ]
-        self.storage.set_session(user_id, "choosing_day", {})
-        self.api.send_message(
-            chat_id, "Выберите день тренировки:", reply_markup=inline_keyboard(buttons)
-        )
+        state = {"msg_id": None}
+        self._render(chat_id, state, ("Выберите день тренировки:", inline_keyboard(buttons)))
+        self.storage.set_session(user_id, "choosing_day", state)
 
-    def _handle_set_input(self, chat_id: int, user_id: int, state: dict, text: str):
-        if current_exercise(state) is None:
-            self._finish_workout(chat_id, user_id, state)
-            return
+    def _begin_workout(self, chat_id: int, user_id: int, day_index: int, msg_id: int | None):
+        program = self.storage.get_program(user_id)
+        if not program or day_index >= len(program["days"]):
+            return "Программа изменилась, начните заново: /train"
+        day = program["days"][day_index]
+        if not day["exercises"]:
+            return "В этом дне нет упражнений"
+        workout_id = self.storage.start_workout(user_id, day_title(day))
+        state = workout.new_session_state(day_title(day), workout_id, day["exercises"])
+        state["msg_id"] = msg_id
+        self._render(chat_id, state, workout.screen_choose(state))
+        self.storage.set_session(user_id, "logging", state)
+        return None
 
-        if text.lower() in ("/skip", "пропустить", "skip"):
-            skip_exercise(state)
-        else:
+    def _workout_text(self, chat_id: int, user_id: int, state: dict, text: str, message: dict):
+        self._cleanup_user_message(chat_id, message)
+        step = state.get("step")
+
+        if step == workout.STEP_WEIGHT:
             try:
-                sets = parse_sets_input(text)
-            except SetParseError as e:
-                self.api.send_message(chat_id, str(e))
+                weight = workout.parse_weight(text)
+            except workout.InputError as e:
+                self._render_error(chat_id, state, workout.screen_weight(state), str(e))
+                self.storage.set_session(user_id, "logging", state)
                 return
-            record_sets(state, sets)
-
-        if is_finished(state):
-            self._finish_workout(chat_id, user_id, state)
+            workout.set_pending_weight(state, weight)
+            self._render(chat_id, state, workout.screen_reps(state))
+        elif step == workout.STEP_REPS:
+            try:
+                reps = workout.parse_reps(text)
+            except workout.InputError as e:
+                self._render_error(chat_id, state, workout.screen_reps(state), str(e))
+                self.storage.set_session(user_id, "logging", state)
+                return
+            workout.record_set(state, reps)
+            ex = workout.current_exercise(state)
+            if workout.sets_done(state) >= ex.get("sets", 0):
+                # план по подходам выполнен — возвращаемся к выбору упражнения
+                workout.finish_exercise(state)
+                self._render(chat_id, state, workout.screen_choose(state))
+            else:
+                self._render(chat_id, state, workout.screen_weight(state))
         else:
-            self.storage.set_session(user_id, "logging", state)
-            self._prompt_current_exercise(chat_id, state)
+            return
+        self.storage.set_session(user_id, "logging", state)
 
-    def _prompt_current_exercise(self, chat_id: int, state: dict):
-        ex = current_exercise(state)
-        idx = state["exercise_index"] + 1
-        total = len(state["exercises"])
-        self.api.send_message(
-            chat_id,
-            f"Упражнение {idx}/{total}: {ex['name']}\n"
-            f"План: {plural_sets(ex.get('sets', 0))}\n\n"
-            f"Запишите фактические подходы через запятую (вес x повторы), "
-            f"например: 80x8, 80x8, 75x6\n"
-            f"Если без веса — просто повторы: 8, 8, 6\n"
-            f"Пропустить упражнение — /skip",
-        )
+    def _workout_callback(self, chat_id: int, user_id: int, state: dict, data: str) -> str | None:
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "ex":
+            index = int(parts[2])
+            if not 0 <= index < len(state["exercises"]):
+                return "Упражнение не найдено"
+            workout.select_exercise(state, index)
+            self._render(chat_id, state, workout.screen_weight(state))
+        elif action == "done":
+            workout.finish_exercise(state)
+            self._render(chat_id, state, workout.screen_choose(state))
+        elif action == "skip":
+            workout.skip_exercise(state)
+            self._render(chat_id, state, workout.screen_choose(state))
+        elif action == "back":
+            workout.back_to_list(state)
+            self._render(chat_id, state, workout.screen_choose(state))
+        elif action == "reweight":
+            state["pending_weight"] = None
+            state["step"] = workout.STEP_WEIGHT
+            self._render(chat_id, state, workout.screen_weight(state))
+        elif action == "finish":
+            self._finish_workout(chat_id, user_id, state)
+            return None
+        else:
+            return None
+
+        self.storage.set_session(user_id, "logging", state)
+        return None
 
     def _finish_workout(self, chat_id: int, user_id: int, state: dict):
-        summary = build_summary(state)
+        summary = workout.build_summary(state)
         self.storage.finish_workout(state["workout_id"], state["log"])
+        self._drop_screen(chat_id, state)
         self.storage.clear_session(user_id)
         self.api.send_message(chat_id, summary)
+        next_state = {"msg_id": None}
+        self._render(chat_id, next_state, workout.screen_after_summary())
 
     # ---------- inline-кнопки ----------
     def _handle_callback(self, callback: dict):
         query_id = callback["id"]
         chat_id = callback["message"]["chat"]["id"]
+        message_id = callback["message"].get("message_id")
         user_id = callback["from"]["id"]
         data = callback.get("data", "")
 
         session = self.storage.get_session(user_id)
+        state = session["data"]
+        if message_id:
+            state["msg_id"] = message_id
 
+        note = None
         if data.startswith("w:"):
             if session["state"] != "wizard":
-                self.api.answer_callback_query(
-                    query_id, "Мастер уже закрыт. Начните заново: /newprogram"
-                )
-                return
-            note = self._handle_wizard_callback(chat_id, user_id, session["data"], data)
-            self.api.answer_callback_query(query_id, note)
-            return
+                note = "Мастер уже закрыт. Начните заново: /newprogram"
+            else:
+                note = self._wizard_callback(chat_id, user_id, state, data)
+        elif data.startswith("e:"):
+            if session["state"] != "editor":
+                note = "Редактор уже закрыт. Открыть снова: /edit"
+            else:
+                note = self._editor_callback(chat_id, user_id, state, data)
+        elif data.startswith("t:"):
+            note = self._train_callback(chat_id, user_id, session, state, data, message_id)
 
-        if data.startswith("train_day:"):
-            day_index = int(data.split(":", 1)[1])
+        self.api.answer_callback_query(query_id, note)
+
+    def _train_callback(self, chat_id, user_id, session, state, data, message_id) -> str | None:
+        action = data.split(":")[1] if ":" in data else ""
+
+        # кнопки, доступные вне тренировки
+        if action == "again":
+            self.storage.clear_session(user_id)
+            self._start_train(chat_id, user_id)
+            return None
+        if action == "program":
             program = self.storage.get_program(user_id)
-            if not program or day_index >= len(program["days"]):
-                self.api.answer_callback_query(
-                    query_id, "Программа изменилась, начните заново: /train"
-                )
-                return
-            day = program["days"][day_index]
-            workout_id = self.storage.start_workout(user_id, day_title(day))
-            state = new_session_state(day_title(day), workout_id, day["exercises"])
-            self.storage.set_session(user_id, "logging", state)
-            self.api.answer_callback_query(query_id)
-            self.api.send_message(chat_id, f"Начинаем: {day_title(day)} 💪")
-            self._prompt_current_exercise(chat_id, state)
-            return
+            if not program:
+                return "Программа ещё не создана"
+            self.api.send_message(chat_id, format_program(program))
+            return None
+        if action == "edit":
+            self.storage.clear_session(user_id)
+            self._start_editor(chat_id, user_id)
+            return None
+        if action == "day":
+            if session["state"] != "choosing_day":
+                return "Выбор дня устарел, начните заново: /train"
+            return self._begin_workout(chat_id, user_id, int(data.split(":")[2]), message_id)
 
-        self.api.answer_callback_query(query_id)
+        if session["state"] != "logging":
+            return "Тренировка уже завершена. Начать новую — /train"
+        return self._workout_callback(chat_id, user_id, state, data)
+
+    # ---------- утилиты ----------
+    @staticmethod
+    def _parse_sets(text: str) -> int | None:
+        try:
+            sets = int(text.strip())
+        except ValueError:
+            return None
+        return sets if 1 <= sets <= MAX_SETS else None
 
 
 def run_polling():
@@ -379,6 +598,11 @@ def run_polling():
 
     me = api.get_me()
     log.info("Бот запущен: @%s", me.get("username"))
+    try:
+        api.set_my_commands(COMMANDS)
+        api.set_chat_menu_button()
+    except Exception:
+        log.exception("Не удалось установить меню команд")
 
     offset = None
     while True:
