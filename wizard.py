@@ -23,6 +23,7 @@ STEP_PICK_EXERCISE = "pick_exercise"
 STEP_CUSTOM_EXERCISE = "custom_exercise"
 STEP_SETS = "sets"
 STEP_MY_LIST = "my_list"
+STEP_PASTE = "paste"
 STEP_CUSTOM_SETS = "custom_sets"
 STEP_DAY_MENU = "day_menu"
 
@@ -100,11 +101,32 @@ def screen_days_count() -> tuple:
         [(str(n), f"w:dc:{n}") for n in range(1, 5)],
         [(str(n), f"w:dc:{n}") for n in range(5, MAX_DAYS + 1)],
     ]
+    buttons.append([("📄 Вставить программу текстом", "w:paste")])
     text = (
         "Создаём программу тренировок.\n\n"
-        "Шаг 1. Сколько тренировочных дней в неделю?" + CANCEL_HINT
+        "Шаг 1. Сколько тренировочных дней в неделю?\n\n"
+        "Если программа уже записана — можно не собирать её по шагам, "
+        "а прислать текстом целиком." + CANCEL_HINT
     )
     return text, inline_keyboard(buttons)
+
+
+def screen_paste() -> tuple:
+    text = (
+        "Пришлите программу одним сообщением — как она у вас записана.\n\n"
+        "Понимаю почти любой вид, например:\n\n"
+        "Понедельник — грудь\n"
+        "Жим лёжа 4х10\n"
+        "Разводка гантелей 3х12\n"
+        "Отжимания на брусьях 3 подхода\n\n"
+        "Среда — спина\n"
+        "Подтягивания 4х8\n"
+        "Тяга блока 3 по 12\n\n"
+        "Дни можно называть как угодно: «День 1», «Понедельник», «Фулбади». "
+        "Из чисел мне нужно только количество подходов — вес и повторения "
+        "запишете уже на тренировке." + CANCEL_HINT
+    )
+    return text, inline_keyboard([[("⬅️ Собрать по шагам", "w:steps")]])
 
 
 def screen_day_comment(state: dict) -> tuple:

@@ -19,6 +19,7 @@
 фактически во время тренировки.
 """
 
+import re
 from datetime import datetime, timedelta
 
 MAX_DAYS = 7
@@ -56,13 +57,33 @@ def plural_days(n: int) -> str:
     return f"{n} дней"
 
 
+def plural_exercises(n: int) -> str:
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} упражнение"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} упражнения"
+    return f"{n} упражнений"
+
+
 def new_day(number: int, name: str = "") -> dict:
     return {"number": number, "name": name or f"День {number}", "exercises": []}
 
 
+SELF_TITLED_RE = re.compile(
+    r"^\s*(?:день|day|тренировка|понедельник|вторник|сред[аы]|четверг|пятниц[аы]|"
+    r"суббот[аы]|воскресенье|пн|вт|ср|чт|пт|сб|вс)\b",
+    re.IGNORECASE,
+)
+
+
 def day_title(day: dict) -> str:
+    """«День 1 — Грудь», но просто «Понедельник — грудь», если название дня
+    уже само по себе указывает на день — иначе получается «День 1 — Понедельник»."""
     number = day.get("number")
-    name = day.get("name") or ""
+    name = (day.get("name") or "").strip()
+    if name and SELF_TITLED_RE.match(name):
+        return name
     if number and name and name != f"День {number}":
         return f"День {number} — {name}"
     if number:

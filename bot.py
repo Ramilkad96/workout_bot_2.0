@@ -14,10 +14,14 @@ import logging
 import time
 
 import catalog
+import changelog
 import editor
+import freeform
+import llm
 import wizard
 import workout
-from config import BOT_TOKEN, DB_PATH, TZ_OFFSET_HOURS
+from config import (ANTHROPIC_API_KEY, BOT_TOKEN, DB_PATH, LLM_MODEL,
+                    LLM_TIMEOUT, TZ_OFFSET_HOURS)
 from program import MAX_SETS, day_title, format_program
 from storage import Storage
 from telegram_api import TelegramAPI, inline_keyboard
@@ -30,9 +34,31 @@ COMMANDS = [
     ("program", "Моя программа"),
     ("edit", "Редактировать программу"),
     ("newprogram", "Составить программу заново"),
+    ("import", "Загрузить программу текстом"),
     ("help", "Как пользоваться ботом"),
+    ("whatsnew", "Что нового в боте"),
     ("cancel", "Отменить текущее действие"),
 ]
+
+WELCOME_TEXT = (
+    "👋 Это дневник тренировок.\n\n"
+    "Он нужен, чтобы тренироваться по своей программе и вести записи прямо "
+    "в чате — вместо блокнота, заметок в телефоне или таблицы.\n\n"
+    "Как это работает:\n"
+    "1️⃣ Заводите программу — по шагам или пришлите её текстом, как она "
+    "у вас записана.\n"
+    "2️⃣ На тренировке открываете нужный день, выбираете упражнение "
+    "в любом порядке и записываете каждый подход: вес, потом повторения.\n"
+    "3️⃣ В конце получаете сводку: что сделали и с какими весами. "
+    "Все тренировки сохраняются.\n\n"
+    "Кому подойдёт:\n"
+    "• тренируетесь по программе — своей или от тренера;\n"
+    "• надоело держать веса и подходы в голове;\n"
+    "• нужен простой дневник без регистрации и лишних экранов.\n\n"
+    "Чего бот не делает: не составляет программу за вас и не даёт "
+    "тренерских советов — он работает по вашей программе.\n\n"
+    "С чего начать:"
+)
 
 HELP_TEXT = (
     "Я помогу тренироваться по твоей собственной программе.\n\n"
@@ -42,6 +68,9 @@ HELP_TEXT = (
     "или просто номер);\n"
     "   • упражнения — из каталога или своим названием;\n"
     "   • сколько подходов в каждом упражнении.\n\n"
+    "📄 /import — прислать готовую программу одним сообщением, в свободной "
+    "форме: бот сам разберёт её на дни и упражнения и покажет результат "
+    "на подтверждение.\n"
     "📋 /program — посмотреть программу.\n"
     "✏️ /edit — изменить программу: дни, упражнения, подходы.\n"
     "🏋️ /train — тренировка: выбираешь упражнение в любом порядке и на "
@@ -52,9 +81,26 @@ HELP_TEXT = (
 
 
 class TrainerBot:
-    def __init__(self, api: TelegramAPI, storage: Storage):
+    def __init__(self, api: TelegramAPI, storage: Storage, llm_parse=None):
         self.api = api
         self.storage = storage
+        # llm_parse(text) -> программа; None значит «работаем без AI».
+        # Вынесено параметром, чтобы тесты подставляли свою заглушку.
+        self.llm_parse = llm_parse
+
+    # ---------- обновления бота ----------
+    def _announce_updates(self, chat_id: int, user_id: int, session: dict):
+        """Один раз после обновления показываем, что изменилось. Только когда
+        человек ничего не делает — посреди тренировки это мешало бы."""
+        if session["state"] != "idle":
+            return
+        seen = self.storage.get_seen_version(user_id)
+        if seen == changelog.VERSION:
+            return
+        releases = changelog.releases_since(seen)
+        self.storage.set_seen_version(user_id, changelog.VERSION)
+        if releases:
+            self.api.send_message(chat_id, changelog.format_releases(releases))
 
     # ---------- служебное ----------
     def handle_update(self, update: dict):
@@ -98,12 +144,26 @@ class TrainerBot:
     # ---------- сообщения ----------
     def _handle_message(self, message: dict):
         chat_id = message["chat"]["id"]
-        user = message["from"]
-        user_id = user["id"]
+        user = message.get("from") or {}
+        user_id = user.get("id")
         text = (message.get("text") or "").strip()
 
-        self.storage.ensure_user(user_id, user.get("username"))
+        if not user_id:
+            return
+        if message["chat"].get("type", "private") != "private":
+            # в группе у каждого своя сессия, но экран один на всех — путаница
+            self.api.send_message(
+                chat_id, "Я работаю только в личных сообщениях: напишите мне в личку."
+            )
+            return
+
+        is_new_user = self.storage.ensure_user(user_id, user.get("username"))
         session = self.storage.get_session(user_id)
+        if is_new_user:
+            # новичку прошлые обновления не нужны — он и так видит свежую версию
+            self.storage.set_seen_version(user_id, changelog.VERSION)
+        else:
+            self._announce_updates(chat_id, user_id, session)
 
         if text.startswith("/"):
             self._handle_command(chat_id, user_id, text, session)
@@ -119,6 +179,14 @@ class TrainerBot:
         if state_name == "logging":
             self._workout_text(chat_id, user_id, session["data"], text, message)
             return
+        if state_name == "import":
+            self._import_text(chat_id, user_id, session["data"], text, offer=False)
+            return
+
+        # человек просто вставил программу в чат, ничего не нажимая
+        if freeform.looks_like_program(text):
+            self._import_text(chat_id, user_id, {"msg_id": None}, text, offer=True)
+            return
 
         self.api.send_message(chat_id, "Не понял. Список команд — /help")
 
@@ -127,7 +195,24 @@ class TrainerBot:
 
         if command == "/start":
             self.storage.clear_session(user_id)
-            self.api.send_message(chat_id, "Привет! " + HELP_TEXT)
+            self.api.send_message(
+                chat_id,
+                WELCOME_TEXT,
+                reply_markup=inline_keyboard([
+                    [("📝 Составить программу по шагам", "s:new")],
+                    [("📄 Прислать программу текстом", "s:import")],
+                    [("❓ Все команды", "s:help")],
+                ]),
+            )
+            return
+        if command == "/whatsnew":
+            self.storage.set_seen_version(user_id, changelog.VERSION)
+            self.api.send_message(
+                chat_id,
+                changelog.format_releases(
+                    changelog.RELEASES[:3], "🆕 Что нового в боте"
+                ),
+            )
             return
         if command == "/help":
             self.api.send_message(chat_id, HELP_TEXT)
@@ -150,6 +235,11 @@ class TrainerBot:
                     format_program(program),
                     reply_markup=inline_keyboard([[("✏️ Редактировать", "t:edit")]]),
                 )
+            return
+        if command == "/import":
+            state = {"msg_id": None, "step": "await_text"}
+            self._render(chat_id, state, freeform.screen_ask_text())
+            self.storage.set_session(user_id, "import", state)
             return
         if command == "/edit":
             self._start_editor(chat_id, user_id)
@@ -180,6 +270,11 @@ class TrainerBot:
         step = state["step"]
         self._cleanup_user_message(chat_id, message)
 
+        if step == wizard.STEP_PASTE:
+            # текст программы: разбираем и уходим в подтверждение
+            import_state = {"msg_id": state.get("msg_id")}
+            self._import_text(chat_id, user_id, import_state, text, offer=False)
+            return
         if step == wizard.STEP_DAY_COMMENT:
             wizard.set_day_comment(state, text)
             self._render(chat_id, state, wizard.screen_pick_group(state, self._my_exercises(user_id)))
@@ -227,6 +322,12 @@ class TrainerBot:
         if action == "dc":
             wizard.set_days_count(state, int(parts[2]))
             self._render(chat_id, state, wizard.screen_day_comment(state))
+        elif action == "paste":
+            state["step"] = wizard.STEP_PASTE
+            self._render(chat_id, state, wizard.screen_paste())
+        elif action == "steps":
+            state["step"] = wizard.STEP_DAYS_COUNT
+            self._render(chat_id, state, wizard.screen_days_count())
         elif action == "nocom":
             wizard.set_day_comment(state, "")
             self._render(chat_id, state, wizard.screen_pick_group(state, self._my_exercises(user_id)))
@@ -311,6 +412,84 @@ class TrainerBot:
                 [[("🏋️ Начать тренировку", "t:again")], [("✏️ Редактировать", "t:edit")]]
             ),
         )
+
+    # ---------- загрузка программы текстом ----------
+    def _import_text(self, chat_id: int, user_id: int, state: dict, text: str, offer: bool):
+        """Сначала бесплатные эвристики; если они не справились — Claude API
+        (когда он настроен). На самопредложении разбора AI не зовём, чтобы не
+        тратить запросы на случайные сообщения."""
+        program, warnings, stats = None, [], {}
+        try:
+            program, warnings, stats = freeform.analyze(text)
+        except freeform.FreeformError as e:
+            heuristic_error = str(e)
+        else:
+            heuristic_error = None
+
+        via_llm = False
+        if self.llm_parse and not offer and (program is None or freeform.looks_weak(stats)):
+            try:
+                program = self.llm_parse(text)
+                warnings, via_llm = [], True
+            except Exception as e:  # noqa: BLE001 — падать из-за AI нельзя
+                log.info("Разбор через LLM не удался: %s", e)
+
+        if program is None:
+            if offer:
+                return
+            self._render_error(
+                chat_id, state, freeform.screen_ask_text(),
+                heuristic_error or "Не получилось разобрать текст.",
+            )
+            self.storage.set_session(user_id, "import", state)
+            return
+
+        state["program"] = program
+        state["warnings"] = warnings
+        screen = (
+            freeform.screen_offer(program, warnings, via_llm) if offer
+            else freeform.screen_confirm(program, warnings, via_llm)
+        )
+        self._render(chat_id, state, screen)
+        self.storage.set_session(user_id, "import", state)
+
+    def _import_callback(self, chat_id: int, user_id: int, state: dict, data: str) -> str | None:
+        action = data.split(":")[1] if ":" in data else ""
+        program = state.get("program")
+
+        if action == "cancel":
+            self._drop_screen(chat_id, state)
+            self.storage.clear_session(user_id)
+            self.api.send_message(chat_id, "Загрузка отменена.")
+            return None
+
+        if action == "retry":
+            state.pop("program", None)
+            state.pop("warnings", None)
+            self._render(chat_id, state, freeform.screen_ask_text())
+            self.storage.set_session(user_id, "import", state)
+            return None
+
+        if action in ("save", "edit"):
+            if not program:
+                return "Программа не найдена, пришлите текст заново"
+            self.storage.save_program(user_id, program, "")
+            if action == "edit":
+                self.storage.clear_session(user_id)
+                self._start_editor(chat_id, user_id)
+                return None
+            self._drop_screen(chat_id, state)
+            self.storage.clear_session(user_id)
+            self.api.send_message(
+                chat_id,
+                "Программа сохранена! 🎉\n\n" + format_program(program),
+                reply_markup=inline_keyboard(
+                    [[("🏋️ Начать тренировку", "t:again")], [("✏️ Редактировать", "t:edit")]]
+                ),
+            )
+            return None
+
+        return None
 
     # ---------- редактор программы ----------
     def _start_editor(self, chat_id: int, user_id: int):
@@ -616,6 +795,7 @@ class TrainerBot:
         return None
 
     def _finish_workout(self, chat_id: int, user_id: int, state: dict):
+        workout.close_open_exercise(state)
         summary = workout.build_summary(state, TZ_OFFSET_HOURS)
         self.storage.finish_workout(state["workout_id"], state["log"])
         self._drop_screen(chat_id, state)
@@ -649,6 +829,22 @@ class TrainerBot:
                 note = "Редактор уже закрыт. Открыть снова: /edit"
             else:
                 note = self._editor_callback(chat_id, user_id, state, data)
+        elif data.startswith("i:"):
+            if session["state"] != "import":
+                note = "Экран устарел. Загрузить программу — /import"
+            else:
+                note = self._import_callback(chat_id, user_id, state, data)
+        elif data.startswith("s:"):
+            action = data.split(":")[1] if ":" in data else ""
+            if action == "new":
+                self.storage.clear_session(user_id)
+                self._start_wizard(chat_id, user_id)
+            elif action == "import":
+                import_state = {"msg_id": None, "step": "await_text"}
+                self._render(chat_id, import_state, freeform.screen_ask_text())
+                self.storage.set_session(user_id, "import", import_state)
+            elif action == "help":
+                self.api.send_message(chat_id, HELP_TEXT)
         elif data.startswith("t:"):
             note = self._train_callback(chat_id, user_id, session, state, data, message_id)
 
@@ -712,7 +908,16 @@ def run_polling():
         )
     api = TelegramAPI(BOT_TOKEN)
     storage = Storage(DB_PATH)
-    trainer = TrainerBot(api, storage)
+
+    llm_parse = None
+    if llm.is_enabled(ANTHROPIC_API_KEY):
+        def llm_parse(text: str) -> dict:
+            return llm.parse_with_llm(text, ANTHROPIC_API_KEY, LLM_MODEL, LLM_TIMEOUT)
+        log.info("Разбор через Claude API включён, модель %s", LLM_MODEL)
+    else:
+        log.info("ANTHROPIC_API_KEY не задан — работаем только на эвристиках")
+
+    trainer = TrainerBot(api, storage, llm_parse)
 
     me = api.get_me()
     log.info("Бот запущен: @%s", me.get("username"))

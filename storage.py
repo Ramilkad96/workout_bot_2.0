@@ -12,7 +12,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    last_seen_version TEXT
 );
 
 CREATE TABLE IF NOT EXISTS programs (
@@ -74,14 +75,43 @@ class Storage:
     def _init_schema(self):
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn):
+        """Добавляем колонки, которых нет в уже существующей базе, — чтобы
+        обновление бота не требовало сносить данные пользователей."""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        if "last_seen_version" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_seen_version TEXT")
 
     # ---- users ----
-    def ensure_user(self, user_id: int, username: str | None):
+    def ensure_user(self, user_id: int, username: str | None) -> bool:
+        """Возвращает True, если пользователь появился впервые — новичку
+        не нужно показывать список прошлых обновлений."""
         with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
             conn.execute(
                 "INSERT INTO users (user_id, username, created_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
                 (user_id, username, now_iso()),
+            )
+        return existing is None
+
+    def get_seen_version(self, user_id: int) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT last_seen_version FROM users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        return row["last_seen_version"] if row else None
+
+    def set_seen_version(self, user_id: int, version: str):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE users SET last_seen_version = ? WHERE user_id = ?",
+                (version, user_id),
             )
 
     # ---- programs ----
