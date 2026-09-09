@@ -34,6 +34,15 @@ CREATE TABLE IF NOT EXISTS workouts (
     FOREIGN KEY (user_id) REFERENCES users(user_id)
 );
 
+CREATE TABLE IF NOT EXISTS user_exercises (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (user_id, name),
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     user_id INTEGER PRIMARY KEY,
     state TEXT NOT NULL,      -- 'idle' | 'awaiting_program' | 'choosing_day' | 'logging'
@@ -123,6 +132,44 @@ class Storage:
                 (user_id, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---- личный список упражнений пользователя ----
+    def add_user_exercise(self, user_id: int, name: str) -> bool:
+        """Возвращает False, если такое упражнение уже есть в списке."""
+        name = name.strip()
+        if not name:
+            return False
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO user_exercises (user_id, name, created_at) "
+                "VALUES (?, ?, ?)",
+                (user_id, name, now_iso()),
+            )
+            return cur.rowcount > 0
+
+    def list_user_exercises(self, user_id: int) -> list:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT name FROM user_exercises WHERE user_id = ? ORDER BY id",
+                (user_id,),
+            ).fetchall()
+        return [r["name"] for r in rows]
+
+    def delete_user_exercise(self, user_id: int, name: str) -> bool:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM user_exercises WHERE user_id = ? AND name = ?",
+                (user_id, name),
+            )
+            return cur.rowcount > 0
+
+    def has_user_exercise(self, user_id: int, name: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM user_exercises WHERE user_id = ? AND name = ?",
+                (user_id, name.strip()),
+            ).fetchone()
+        return row is not None
 
     # ---- sessions (текущее состояние диалога с пользователем) ----
     def get_session(self, user_id: int) -> dict:

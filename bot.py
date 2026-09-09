@@ -17,7 +17,7 @@ import catalog
 import editor
 import wizard
 import workout
-from config import BOT_TOKEN, DB_PATH
+from config import BOT_TOKEN, DB_PATH, TZ_OFFSET_HOURS
 from program import MAX_SETS, day_title, format_program
 from storage import Storage
 from telegram_api import TelegramAPI, inline_keyboard
@@ -173,20 +173,25 @@ class TrainerBot:
         self._render(chat_id, state, wizard.screen_days_count())
         self.storage.set_session(user_id, "wizard", state)
 
+    def _my_exercises(self, user_id: int) -> list:
+        return self.storage.list_user_exercises(user_id)
+
     def _wizard_text(self, chat_id: int, user_id: int, state: dict, text: str, message: dict):
         step = state["step"]
         self._cleanup_user_message(chat_id, message)
 
         if step == wizard.STEP_DAY_COMMENT:
             wizard.set_day_comment(state, text)
-            self._render(chat_id, state, wizard.screen_pick_group(state))
+            self._render(chat_id, state, wizard.screen_pick_group(state, self._my_exercises(user_id)))
         elif step == wizard.STEP_CUSTOM_EXERCISE:
             name = text.strip()[:100]
             if not name:
                 return
             state["pending_exercise"] = name
+            state["is_custom"] = not self.storage.has_user_exercise(user_id, name)
+            state["save_to_list"] = False
             state["step"] = wizard.STEP_SETS
-            self._render(chat_id, state, wizard.screen_sets(name))
+            self._render(chat_id, state, self._wizard_sets_screen(state))
         elif step == wizard.STEP_CUSTOM_SETS:
             sets = self._parse_sets(text)
             if sets is None:
@@ -196,11 +201,24 @@ class TrainerBot:
                 )
                 self.storage.set_session(user_id, "wizard", state)
                 return
-            wizard.add_exercise(state, state["pending_exercise"], sets)
-            self._render(chat_id, state, wizard.screen_day_menu(state))
+            self._wizard_add_exercise(chat_id, user_id, state, sets)
         else:
             return
         self.storage.set_session(user_id, "wizard", state)
+
+    def _wizard_sets_screen(self, state: dict) -> tuple:
+        return wizard.screen_sets(
+            state["pending_exercise"],
+            is_custom=state.get("is_custom", False),
+            save_to_list=state.get("save_to_list", False),
+        )
+
+    def _wizard_add_exercise(self, chat_id: int, user_id: int, state: dict, sets: int):
+        name = state["pending_exercise"]
+        if state.get("is_custom") and state.get("save_to_list"):
+            self.storage.add_user_exercise(user_id, name)
+        wizard.add_exercise(state, name, sets)
+        self._render(chat_id, state, wizard.screen_day_menu(state))
 
     def _wizard_callback(self, chat_id: int, user_id: int, state: dict, data: str) -> str | None:
         parts = data.split(":")
@@ -211,7 +229,7 @@ class TrainerBot:
             self._render(chat_id, state, wizard.screen_day_comment(state))
         elif action == "nocom":
             wizard.set_day_comment(state, "")
-            self._render(chat_id, state, wizard.screen_pick_group(state))
+            self._render(chat_id, state, wizard.screen_pick_group(state, self._my_exercises(user_id)))
         elif action == "grp":
             group_index = int(parts[2])
             if not catalog.is_valid(group_index):
@@ -221,28 +239,46 @@ class TrainerBot:
             self._render(chat_id, state, wizard.screen_pick_exercise(group_index))
         elif action == "groups":
             state["step"] = wizard.STEP_PICK_GROUP
-            self._render(chat_id, state, wizard.screen_pick_group(state))
+            self._render(chat_id, state, wizard.screen_pick_group(state, self._my_exercises(user_id)))
+        elif action == "mine":
+            my_exercises = self._my_exercises(user_id)
+            if not my_exercises:
+                return "Список пуст"
+            state["step"] = wizard.STEP_MY_LIST
+            self._render(chat_id, state, wizard.screen_my_exercises(my_exercises))
+        elif action == "mex":
+            my_exercises = self._my_exercises(user_id)
+            index = int(parts[2])
+            if not 0 <= index < len(my_exercises):
+                return "Упражнение не найдено"
+            state["pending_exercise"] = my_exercises[index]
+            state["is_custom"] = False
+            state["step"] = wizard.STEP_SETS
+            self._render(chat_id, state, self._wizard_sets_screen(state))
+        elif action == "savetoggle":
+            state["save_to_list"] = not state.get("save_to_list", False)
+            self._render(chat_id, state, self._wizard_sets_screen(state))
         elif action == "ex":
             group_index, exercise_index = int(parts[2]), int(parts[3])
             if not catalog.is_valid(group_index, exercise_index):
                 return "Упражнение не найдено"
             state["pending_exercise"] = catalog.exercise_name(group_index, exercise_index)
+            state["is_custom"] = False
             state["step"] = wizard.STEP_SETS
-            self._render(chat_id, state, wizard.screen_sets(state["pending_exercise"]))
+            self._render(chat_id, state, self._wizard_sets_screen(state))
         elif action == "own":
             state["step"] = wizard.STEP_CUSTOM_EXERCISE
             self._render(chat_id, state, wizard.screen_custom_exercise())
         elif action == "sets":
             if not state.get("pending_exercise"):
                 return "Сначала выберите упражнение"
-            wizard.add_exercise(state, state["pending_exercise"], int(parts[2]))
-            self._render(chat_id, state, wizard.screen_day_menu(state))
+            self._wizard_add_exercise(chat_id, user_id, state, int(parts[2]))
         elif action == "setsx":
             state["step"] = wizard.STEP_CUSTOM_SETS
             self._render(chat_id, state, wizard.screen_custom_sets())
         elif action == "more":
             state["step"] = wizard.STEP_PICK_GROUP
-            self._render(chat_id, state, wizard.screen_pick_group(state))
+            self._render(chat_id, state, wizard.screen_pick_group(state, self._my_exercises(user_id)))
         elif action == "undo":
             removed = wizard.remove_last_exercise(state)
             self._render(chat_id, state, wizard.screen_day_menu(state))
@@ -302,26 +338,53 @@ class TrainerBot:
             if not name:
                 return
             state["pending_exercise"] = name
+            state["is_custom"] = not self.storage.has_user_exercise(user_id, name)
+            state["save_to_list"] = False
             state["view"] = editor.VIEW_SETS
-            self._render(chat_id, state, editor.screen_sets(name))
+            self._render(chat_id, state, self._editor_sets_screen(state))
+        elif view == editor.VIEW_MY_ADD:
+            name = text.strip()[:100]
+            if not name:
+                return
+            added = self.storage.add_user_exercise(user_id, name)
+            state["view"] = editor.VIEW_MY_LIST
+            screen = editor.screen_my_list(self._my_exercises(user_id))
+            if added:
+                self._render(chat_id, state, screen)
+            else:
+                self._render_error(chat_id, state, screen, "Такое упражнение уже есть в списке.")
         elif view == editor.VIEW_CUSTOM_SETS:
             sets = self._parse_sets(text)
             if sets is None:
                 self._render_error(
                     chat_id, state, editor.screen_custom_sets(),
                     f"Нужно число от 1 до {MAX_SETS}.",
-                )
+                )  # экран ввода остаётся тем же, ошибка сверху
                 self._editor_save(user_id, state)
                 return
-            self._editor_apply_sets(chat_id, state, sets)
+            self._editor_apply_sets(chat_id, user_id, state, sets)
         else:
             return
         self._editor_save(user_id, state)
 
-    def _editor_apply_sets(self, chat_id: int, state: dict, sets: int):
+    def _editor_sets_screen(self, state: dict) -> tuple:
+        title = state.get("pending_exercise")
+        if not title:
+            day = editor.current_day(state)
+            title = day["exercises"][state["exercise"]]["name"]
+        return editor.screen_sets(
+            title,
+            is_custom=state.get("is_custom", False),
+            save_to_list=state.get("save_to_list", False),
+        )
+
+    def _editor_apply_sets(self, chat_id: int, user_id: int, state: dict, sets: int):
         """Подходы задаются и при добавлении упражнения, и при его правке."""
         if state.get("pending_exercise"):
-            editor.add_exercise(state, state["pending_exercise"], sets)
+            name = state["pending_exercise"]
+            if state.get("is_custom") and state.get("save_to_list"):
+                self.storage.add_user_exercise(user_id, name)
+            editor.add_exercise(state, name, sets)
             self._render(chat_id, state, editor.screen_day(state))
         else:
             editor.change_sets(state, sets)
@@ -361,10 +424,17 @@ class TrainerBot:
             state["exercise"] = int(parts[2])
             state["view"] = editor.VIEW_EXERCISE
             self._render(chat_id, state, editor.screen_exercise(state))
+        elif action == "daysave":
+            state["view"] = editor.VIEW_DAYS
+            state["day"] = None
+            self.storage.save_program(user_id, state["program"], "")
+            self._render(chat_id, state, editor.screen_days(state))
+            self._editor_save(user_id, state)
+            return "День сохранён"
         elif action == "addex":
             state["pending_exercise"] = ""
             state["view"] = editor.VIEW_PICK_GROUP
-            self._render(chat_id, state, editor.screen_pick_group(state))
+            self._render(chat_id, state, editor.screen_pick_group(state, self._my_exercises(user_id)))
         elif action == "grp":
             group_index = int(parts[2])
             if not catalog.is_valid(group_index):
@@ -374,35 +444,62 @@ class TrainerBot:
             self._render(chat_id, state, editor.screen_pick_exercise(group_index))
         elif action == "groups":
             state["view"] = editor.VIEW_PICK_GROUP
-            self._render(chat_id, state, editor.screen_pick_group(state))
+            self._render(chat_id, state, editor.screen_pick_group(state, self._my_exercises(user_id)))
+        elif action == "mine":
+            my_exercises = self._my_exercises(user_id)
+            if not my_exercises:
+                return "Список пуст"
+            state["view"] = editor.VIEW_PICK_MINE
+            self._render(chat_id, state, editor.screen_my_pick(my_exercises))
+        elif action == "mex":
+            my_exercises = self._my_exercises(user_id)
+            index = int(parts[2])
+            if not 0 <= index < len(my_exercises):
+                return "Упражнение не найдено"
+            state["pending_exercise"] = my_exercises[index]
+            state["is_custom"] = False
+            state["view"] = editor.VIEW_SETS
+            self._render(chat_id, state, self._editor_sets_screen(state))
+        elif action == "savetoggle":
+            state["save_to_list"] = not state.get("save_to_list", False)
+            self._render(chat_id, state, self._editor_sets_screen(state))
+        elif action == "mylist":
+            state["view"] = editor.VIEW_MY_LIST
+            self._render(chat_id, state, editor.screen_my_list(self._my_exercises(user_id)))
+        elif action == "myadd":
+            state["view"] = editor.VIEW_MY_ADD
+            self._render(chat_id, state, editor.screen_my_add())
+        elif action == "mydel":
+            my_exercises = self._my_exercises(user_id)
+            index = int(parts[2])
+            if not 0 <= index < len(my_exercises):
+                return "Упражнение не найдено"
+            self.storage.delete_user_exercise(user_id, my_exercises[index])
+            self._render(chat_id, state, editor.screen_my_list(self._my_exercises(user_id)))
         elif action == "exsel":
             group_index, exercise_index = int(parts[2]), int(parts[3])
             if not catalog.is_valid(group_index, exercise_index):
                 return "Упражнение не найдено"
             state["pending_exercise"] = catalog.exercise_name(group_index, exercise_index)
+            state["is_custom"] = False
             state["view"] = editor.VIEW_SETS
-            self._render(chat_id, state, editor.screen_sets(state["pending_exercise"]))
+            self._render(chat_id, state, self._editor_sets_screen(state))
         elif action == "own":
             state["view"] = editor.VIEW_CUSTOM_EXERCISE
             self._render(chat_id, state, editor.screen_custom_exercise())
         elif action == "setsedit":
             state["pending_exercise"] = ""
-            day = editor.current_day(state)
-            title = day["exercises"][state["exercise"]]["name"]
+            state["is_custom"] = False
             state["view"] = editor.VIEW_SETS
-            self._render(chat_id, state, editor.screen_sets(title))
+            self._render(chat_id, state, self._editor_sets_screen(state))
         elif action == "sets":
-            self._editor_apply_sets(chat_id, state, int(parts[2]))
+            self._editor_apply_sets(chat_id, user_id, state, int(parts[2]))
         elif action == "setsx":
             state["view"] = editor.VIEW_CUSTOM_SETS
             self._render(chat_id, state, editor.screen_custom_sets())
         elif action == "delex":
             editor.delete_exercise(state)
             self._render(chat_id, state, editor.screen_day(state))
-        elif action in ("up", "down"):
-            if not editor.move_exercise(state, -1 if action == "up" else 1):
-                return "Дальше двигать некуда"
-            self._render(chat_id, state, editor.screen_exercise(state))
         elif action == "done":
             program = state["program"]
             self.storage.save_program(user_id, program, "")
@@ -498,6 +595,13 @@ class TrainerBot:
         elif action == "back":
             workout.back_to_list(state)
             self._render(chat_id, state, workout.screen_choose(state))
+        elif action == "wq":
+            try:
+                weight = float(parts[2])
+            except (IndexError, ValueError):
+                return "Не понял вес"
+            workout.set_pending_weight(state, weight)
+            self._render(chat_id, state, workout.screen_reps(state))
         elif action == "reweight":
             state["pending_weight"] = None
             state["step"] = workout.STEP_WEIGHT
@@ -512,13 +616,14 @@ class TrainerBot:
         return None
 
     def _finish_workout(self, chat_id: int, user_id: int, state: dict):
-        summary = workout.build_summary(state)
+        summary = workout.build_summary(state, TZ_OFFSET_HOURS)
         self.storage.finish_workout(state["workout_id"], state["log"])
         self._drop_screen(chat_id, state)
-        self.storage.clear_session(user_id)
         self.api.send_message(chat_id, summary)
-        next_state = {"msg_id": None}
-        self._render(chat_id, next_state, workout.screen_after_summary())
+        # тренировку держим в сессии — её можно открыть и поправить
+        after = {"msg_id": None, "workout": state}
+        self._render(chat_id, after, workout.screen_after_summary())
+        self.storage.set_session(user_id, "after_workout", after)
 
     # ---------- inline-кнопки ----------
     def _handle_callback(self, callback: dict):
@@ -557,11 +662,24 @@ class TrainerBot:
             self.storage.clear_session(user_id)
             self._start_train(chat_id, user_id)
             return None
+        if action == "editlast":
+            last = state.get("workout") if session["state"] == "after_workout" else None
+            if not last:
+                return "Прошлая тренировка больше недоступна"
+            last["msg_id"] = None
+            self._render(chat_id, last, workout.screen_choose(last))
+            self.storage.set_session(user_id, "logging", last)
+            return None
         if action == "program":
             program = self.storage.get_program(user_id)
             if not program:
                 return "Программа ещё не создана"
-            self.api.send_message(chat_id, format_program(program))
+            # кнопка «Редактировать» показывается только вместе с самой программой
+            self.api.send_message(
+                chat_id,
+                format_program(program),
+                reply_markup=inline_keyboard([[("✏️ Редактировать", "t:edit")]]),
+            )
             return None
         if action == "edit":
             self.storage.clear_session(user_id)

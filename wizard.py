@@ -22,6 +22,7 @@ STEP_PICK_GROUP = "pick_group"
 STEP_PICK_EXERCISE = "pick_exercise"
 STEP_CUSTOM_EXERCISE = "custom_exercise"
 STEP_SETS = "sets"
+STEP_MY_LIST = "my_list"
 STEP_CUSTOM_SETS = "custom_sets"
 STEP_DAY_MENU = "day_menu"
 
@@ -38,6 +39,8 @@ def new_state() -> dict:
         "days": [],
         "pending_exercise": "",
         "group_index": None,
+        "save_to_list": False,   # добавить своё упражнение в личный список
+        "is_custom": False,      # текущее упражнение введено вручную
     }
 
 
@@ -64,6 +67,8 @@ def add_exercise(state: dict, name: str, sets: int):
     current_day(state)["exercises"].append({"name": name.strip(), "sets": int(sets)})
     state["pending_exercise"] = ""
     state["group_index"] = None
+    state["save_to_list"] = False
+    state["is_custom"] = False
     state["step"] = STEP_DAY_MENU
 
 
@@ -117,11 +122,13 @@ def screen_day_comment(state: dict) -> tuple:
     return text, inline_keyboard([[("Пропустить", "w:nocom")]])
 
 
-def screen_pick_group(state: dict) -> tuple:
+def screen_pick_group(state: dict, my_exercises: list | None = None) -> tuple:
     day = current_day(state)
     number = len(day["exercises"]) + 1
     names = catalog.group_names()
     buttons = []
+    if my_exercises:
+        buttons.append([(f"⭐ Мои упражнения ({len(my_exercises)})", "w:mine")])
     for i in range(0, len(names), 2):
         row = [(names[i], f"w:grp:{i}")]
         if i + 1 < len(names):
@@ -145,17 +152,27 @@ def screen_pick_exercise(group_index: int) -> tuple:
     return text, inline_keyboard(buttons)
 
 
+def screen_my_exercises(my_exercises: list) -> tuple:
+    buttons = [[(name, f"w:mex:{i}")] for i, name in enumerate(my_exercises)]
+    buttons.append([("⬅️ К группам", "w:groups"), ("✍️ Своё", "w:own")])
+    return "⭐ Мои упражнения:", inline_keyboard(buttons)
+
+
 def screen_custom_exercise() -> tuple:
     return "Напишите название упражнения:" + CANCEL_HINT, None
 
 
-def screen_sets(exercise_name: str) -> tuple:
+def screen_sets(exercise_name: str, is_custom: bool = False, save_to_list: bool = False) -> tuple:
     buttons = [
         [(str(n), f"w:sets:{n}") for n in range(1, 5)],
         [(str(n), f"w:sets:{n}") for n in range(5, 9)],
         [("Другое количество", "w:setsx")],
     ]
     text = f"{exercise_name}\n\nСколько подходов?"
+    if is_custom:
+        # своё упражнение можно сохранить в личный список — пригодится дальше
+        label = "⭐ Сохранить в мои упражнения: да" if save_to_list else "☆ Сохранить в мои упражнения: нет"
+        buttons.insert(0, [(label, "w:savetoggle")])
     return text, inline_keyboard(buttons)
 
 

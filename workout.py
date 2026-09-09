@@ -18,7 +18,7 @@
 import re
 from datetime import datetime, timezone
 
-from program import plural_sets
+from program import format_datetime, plural_sets
 from telegram_api import inline_keyboard
 
 STATUS_PENDING = "pending"
@@ -49,8 +49,8 @@ def parse_weight(text: str) -> float:
     value = value.replace("кг", "").replace("kg", "").strip()
     if not _NUMBER_RE.match(value):
         raise InputError(
-            "Не понял вес. Введите число, например: 80 или 62.5\n"
-            "Если упражнение с собственным весом — отправьте «-»"
+            "Не понял вес. Введите число, например: 80 или 62.5 — "
+            "либо выберите кнопкой ниже."
         )
     weight = float(value.replace(",", "."))
     if not 0 <= weight <= MAX_WEIGHT:
@@ -179,8 +179,13 @@ def duration_minutes(state: dict) -> int:
     return int((datetime.now(timezone.utc) - started).total_seconds() // 60)
 
 
-def build_summary(state: dict) -> str:
-    lines = [f"🏁 Тренировка «{state['day_name']}» завершена!", ""]
+def build_summary(state: dict, tz_offset_hours: int = 3) -> str:
+    finished_at = datetime.now(timezone.utc).isoformat()
+    lines = [
+        f"🏁 Тренировка «{state['day_name']}» завершена!",
+        f"📅 {format_datetime(finished_at, tz_offset_hours)}",
+        "",
+    ]
     for ex, entry in zip(state["exercises"], state["log"]):
         if entry["sets"]:
             lines.append(f"✅ {ex['name']}")
@@ -232,22 +237,36 @@ def screen_weight(state: dict) -> tuple:
     lines.append("")
     if done >= planned:
         # план выполнен, но добавить лишний подход никто не мешает
-        lines.append(f"Подход {done + 1} (сверх плана). Введите вес в кг:")
+        lines.append(f"Подход {done + 1} (сверх плана)")
     else:
-        lines.append(f"Подход {done + 1} из {planned}. Введите вес в кг:")
-    previous = last_weight(state)
-    if previous is not None:
-        hint = f"{previous:g}" if previous else "свой вес"
-        lines.append(f"(прошлый подход — {hint})")
-    lines.append("Свой вес — отправьте «-»")
+        lines.append(f"Подход {done + 1} из {planned}")
+    lines.append("")
+    lines.append("Введите вес числом или выберите кнопкой:")
 
     buttons = []
+    quick = []
+    previous = last_weight(state)
+    if previous:
+        quick.append((f"🔁 {previous:g} кг", f"t:wq:{previous:g}"))
+    for step in (weight_suggestions(previous)):
+        quick.append((f"{step:g}", f"t:wq:{step:g}"))
+    if quick:
+        buttons.append(quick[:4])
+    buttons.append([("🤸 Без веса", "t:wq:0")])
     if entry["sets"]:
         buttons.append([("✅ Упражнение выполнено", "t:done")])
     else:
         buttons.append([("⏭ Пропустить упражнение", "t:skip")])
     buttons.append([("⬅️ К списку упражнений", "t:back")])
     return "\n".join(lines), inline_keyboard(buttons)
+
+
+def weight_suggestions(previous: float | None) -> list:
+    """Соседние веса к прошлому подходу: обычно вес либо тот же, либо ±шаг."""
+    if not previous:
+        return []
+    options = [previous - 5, previous - 2.5, previous + 2.5, previous + 5]
+    return [w for w in options if 0 < w <= MAX_WEIGHT][:3]
 
 
 def screen_reps(state: dict) -> tuple:
@@ -265,7 +284,8 @@ def screen_reps(state: dict) -> tuple:
 
 def screen_after_summary() -> tuple:
     buttons = [
-        [("🏋️ Ещё тренировка", "t:again")],
-        [("📋 Моя программа", "t:program"), ("✏️ Редактировать", "t:edit")],
+        [("✏️ Редактировать прошлую тренировку", "t:editlast")],
+        [("🏋️ Начать следующую тренировку", "t:again")],
+        [("📋 Посмотреть программу", "t:program")],
     ]
     return "Что дальше?", inline_keyboard(buttons)

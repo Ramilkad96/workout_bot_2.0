@@ -225,6 +225,39 @@ class WizardTests(BaseBotTest):
         self.assertEqual(day1["exercises"][1], {"name": "Кроссовер лёжа", "sets": 7})
         self.assertEqual(program["days"][1]["name"], "День 2")
 
+    def test_custom_exercise_can_be_saved_to_my_list(self):
+        self.send("/newprogram")
+        self.click("w:dc:1")
+        self.click("w:nocom")
+        self.click("w:own")
+        self.send("Тяга Пендлея")
+        self.assertIn("w:savetoggle", self.api.buttons())
+        self.assertIn("☆ Сохранить в мои упражнения: нет", self.api.button_labels())
+
+        self.click("w:savetoggle")
+        self.assertIn("⭐ Сохранить в мои упражнения: да", self.api.button_labels())
+        self.click("w:sets:4")
+        self.assertEqual(self.storage.list_user_exercises(self.user_id), ["Тяга Пендлея"])
+
+        # дальше упражнение доступно кнопкой, без набора текста
+        self.click("w:more")
+        self.assertIn("w:mine", self.api.buttons())
+        self.click("w:mine")
+        self.click("w:mex:0")
+        self.click("w:sets:3")
+        self.click("w:dayend")
+        exercises = self.storage.get_program(self.user_id)["days"][0]["exercises"]
+        self.assertEqual([e["name"] for e in exercises], ["Тяга Пендлея", "Тяга Пендлея"])
+
+    def test_custom_exercise_not_saved_by_default(self):
+        self.send("/newprogram")
+        self.click("w:dc:1")
+        self.click("w:nocom")
+        self.click("w:own")
+        self.send("Разовое упражнение")
+        self.click("w:sets:3")
+        self.assertEqual(self.storage.list_user_exercises(self.user_id), [])
+
     def test_day_name_examples_cover_fullbody(self):
         self.send("/newprogram")
         self.click("w:dc:3")
@@ -292,19 +325,58 @@ class EditorTests(BaseBotTest):
             self.storage.get_program(self.user_id)["days"][0]["exercises"][0]["sets"], 6
         )
 
-    def test_move_exercise_up_and_down(self):
-        self.make_program(days=1, exercises_per_day=2)
-        first, second = [
-            ex["name"] for ex in self.storage.get_program(self.user_id)["days"][0]["exercises"]
-        ]
+    def test_day_save_button_returns_to_days(self):
+        """«К дням» больше нет — день закрывается кнопкой «Сохранить день»."""
+        self.make_program(days=2, exercises_per_day=1)
         self.send("/edit")
         self.click("e:day:0")
-        self.click("e:ex:1")
-        self.click("e:up")
-        names = [ex["name"] for ex in self.storage.get_program(self.user_id)["days"][0]["exercises"]]
-        self.assertEqual(names, [second, first])
-        self.click("e:up")
-        self.assertEqual(self.api.last_note(), "Дальше двигать некуда")
+        self.assertIn("e:daysave", self.api.buttons())
+        self.assertNotIn("e:days", self.api.buttons())
+
+        self.click("e:rename")
+        self.send("Понедельник")
+        self.click("e:daysave")
+        self.assertEqual(self.api.last_note(), "День сохранён")
+        self.assertIn("Выберите день", self.api.screen())
+        self.assertEqual(
+            self.storage.get_program(self.user_id)["days"][0]["name"], "Понедельник"
+        )
+
+    def test_my_exercises_management(self):
+        self.make_program(days=1, exercises_per_day=1)
+        self.send("/edit")
+        self.assertIn("e:mylist", self.api.buttons())
+        self.click("e:mylist")
+        self.assertIn("Список пуст", self.api.screen())
+
+        self.click("e:myadd")
+        self.send("Кроссовер лёжа на полу")
+        self.assertIn("🗑 Кроссовер лёжа на полу", self.api.button_labels())
+        self.assertEqual(self.storage.list_user_exercises(self.user_id), ["Кроссовер лёжа на полу"])
+
+        # дубликат не добавляется
+        self.click("e:myadd")
+        self.send("Кроссовер лёжа на полу")
+        self.assertIn("уже есть в списке", self.api.screen())
+        self.assertEqual(len(self.storage.list_user_exercises(self.user_id)), 1)
+
+        # удаление
+        self.click("e:mydel:0")
+        self.assertEqual(self.storage.list_user_exercises(self.user_id), [])
+
+    def test_my_exercise_can_be_picked_in_editor(self):
+        self.storage.ensure_user(self.user_id, "tester")
+        self.storage.add_user_exercise(self.user_id, "Тяга Пендлея")
+        self.make_program(days=1, exercises_per_day=1)
+        self.send("/edit")
+        self.click("e:day:0")
+        self.click("e:addex")
+        self.assertIn("e:mine", self.api.buttons())
+        self.click("e:mine")
+        self.click("e:mex:0")
+        self.click("e:sets:4")
+        exercises = self.storage.get_program(self.user_id)["days"][0]["exercises"]
+        self.assertEqual(exercises[-1], {"name": "Тяга Пендлея", "sets": 4})
 
     def test_add_and_delete_day_renumbers(self):
         self.make_program(days=2, exercises_per_day=1)
@@ -366,7 +438,10 @@ class WorkoutTests(BaseBotTest):
         screen = self.api.screen()
         self.assertIn("Подход 2 из 3", screen)
         self.assertIn("80 кг x 8", screen)
-        self.assertIn("прошлый подход — 80", screen)
+        # строки про «-» больше нет, вместо неё кнопки
+        self.assertNotIn("отправьте «-»", screen)
+        self.assertIn("t:wq:80", self.api.buttons())
+        self.assertIn("t:wq:0", self.api.buttons())
 
         # второй подход с другим весом
         self.send("82.5")
@@ -457,17 +532,83 @@ class WorkoutTests(BaseBotTest):
 
         # после сводки — выбор следующего шага
         self.assertIn("Что дальше?", self.api.screen())
-        self.assertEqual(self.api.buttons(), ["t:again", "t:program", "t:edit"])
+        self.assertEqual(self.api.buttons(), ["t:editlast", "t:again", "t:program"])
+        self.assertEqual(
+            self.api.button_labels(),
+            [
+                "✏️ Редактировать прошлую тренировку",
+                "🏋️ Начать следующую тренировку",
+                "📋 Посмотреть программу",
+            ],
+        )
 
         history = self.storage.get_history(self.user_id)
         self.assertEqual(len(history), 1)
-        self.assertEqual(self.storage.get_session(self.user_id)["state"], "idle")
+        # тренировка остаётся в сессии, чтобы её можно было поправить
+        self.assertEqual(self.storage.get_session(self.user_id)["state"], "after_workout")
 
     def test_next_step_buttons_work(self):
         self.start_workout(exercises_per_day=1)
         self.click("t:finish")
         self.click("t:again")
         self.assertIn("Выберите день", self.api.screen())
+
+    def test_summary_contains_date(self):
+        from datetime import datetime, timedelta, timezone
+        from config import TZ_OFFSET_HOURS
+        from program import MONTHS
+
+        self.start_workout(exercises_per_day=1)
+        self.click("t:ex:0")
+        self.send("60")
+        self.send("10")
+        self.click("t:finish")
+
+        now = datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
+        expected = f"{now.day} {MONTHS[now.month - 1]} {now.year}"
+        self.assertIn(expected, self.api.all_text())
+
+    def test_edit_last_workout_after_summary(self):
+        self.start_workout(exercises_per_day=2)
+        self.click("t:ex:0")
+        self.send("60")
+        self.send("10")
+        self.click("t:done")
+        self.click("t:finish")
+
+        # возвращаемся в ту же тренировку и дописываем второе упражнение
+        self.click("t:editlast")
+        self.assertIn("Выберите упражнение", self.api.screen())
+        self.assertIn("60 кг x 10", self.api.screen())
+        self.click("t:ex:1")
+        self.send("30")
+        self.send("12")
+        self.click("t:done")
+        self.click("t:finish")
+
+        # тренировка одна и та же, а не новая запись в истории
+        history = self.storage.get_history(self.user_id)
+        self.assertEqual(len(history), 1)
+        self.assertIn("30 кг x 12", self.api.all_text())
+
+    def test_quick_weight_button(self):
+        self.start_workout(exercises_per_day=1)
+        self.click("t:ex:0")
+        self.click("t:wq:0")           # «Без веса»
+        self.assertIn("свой вес", self.api.screen())
+        self.send("12")
+        self.click("t:ex:0")
+        self.click("t:wq:60")          # быстрый выбор веса кнопкой
+        self.assertIn("60 кг", self.api.screen())
+        self.send("8")
+        self.assertIn("60 кг x 8", self.api.screen())
+
+    def test_edit_button_only_on_program_view(self):
+        self.start_workout(exercises_per_day=1)
+        self.click("t:finish")
+        self.assertNotIn("t:edit", self.api.buttons())   # экран «Что дальше?»
+        self.click("t:program")
+        self.assertIn("t:edit", self.api.buttons())      # а вот вместе с программой — да
 
     def test_train_without_program(self):
         self.send("/train")

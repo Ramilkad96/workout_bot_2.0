@@ -19,8 +19,22 @@
 фактически во время тренировки.
 """
 
+from datetime import datetime, timedelta
+
 MAX_DAYS = 7
 MAX_SETS = 20
+
+MONTHS = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def format_datetime(iso_value: str, tz_offset_hours: int = 3) -> str:
+    """«9 сентября 2026, 19:40» — время с поправкой на часовой пояс
+    (сервер обычно живёт в UTC)."""
+    moment = datetime.fromisoformat(iso_value) + timedelta(hours=tz_offset_hours)
+    return f"{moment.day} {MONTHS[moment.month - 1]} {moment.year}, {moment:%H:%M}"
 
 
 def plural_sets(n: int) -> str:
@@ -63,7 +77,8 @@ def format_day(day: dict, with_header: bool = True) -> str:
     if not day["exercises"]:
         lines.append("   (упражнений пока нет)")
     for i, ex in enumerate(day["exercises"], start=1):
-        lines.append(f"   {i}. {ex['name']} — {plural_sets(ex['sets'])}")
+        # .get — на случай программы, сохранённой предыдущей версией бота
+        lines.append(f"   {i}. {ex['name']} — {plural_sets(ex.get('sets', 0))}")
     return "\n".join(lines)
 
 

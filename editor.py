@@ -19,6 +19,9 @@ VIEW_PICK_EXERCISE = "pick_exercise"
 VIEW_CUSTOM_EXERCISE = "custom_exercise"
 VIEW_SETS = "sets"
 VIEW_CUSTOM_SETS = "custom_sets"
+VIEW_MY_LIST = "my_list"
+VIEW_MY_ADD = "my_add"
+VIEW_PICK_MINE = "pick_mine"
 
 
 def new_state(program: dict) -> dict:
@@ -29,6 +32,8 @@ def new_state(program: dict) -> dict:
         "exercise": None,
         "pending_exercise": "",
         "group_index": None,
+        "save_to_list": False,
+        "is_custom": False,
         "msg_id": None,
     }
 
@@ -83,6 +88,8 @@ def add_exercise(state: dict, name: str, sets: int):
     current_day(state)["exercises"].append({"name": name.strip()[:100], "sets": int(sets)})
     state["pending_exercise"] = ""
     state["group_index"] = None
+    state["save_to_list"] = False
+    state["is_custom"] = False
     state["view"] = VIEW_DAY
 
 
@@ -97,17 +104,6 @@ def change_sets(state: dict, sets: int):
     state["view"] = VIEW_EXERCISE
 
 
-def move_exercise(state: dict, delta: int) -> bool:
-    exercises = current_day(state)["exercises"]
-    i = state["exercise"]
-    j = i + delta
-    if not (0 <= j < len(exercises)):
-        return False
-    exercises[i], exercises[j] = exercises[j], exercises[i]
-    state["exercise"] = j
-    return True
-
-
 # ---------------- экраны ----------------
 
 def screen_days(state: dict) -> tuple:
@@ -117,6 +113,7 @@ def screen_days(state: dict) -> tuple:
     ]
     if len(program["days"]) < MAX_DAYS:
         buttons.append([("➕ Добавить день", "e:adday")])
+    buttons.append([("⭐ Мои упражнения", "e:mylist")])
     buttons.append([("✅ Готово", "e:done")])
     text = format_program(program) + "\n\nВыберите день, который хотите изменить:"
     return text, inline_keyboard(buttons)
@@ -128,10 +125,9 @@ def screen_day(state: dict) -> tuple:
     for i, ex in enumerate(day["exercises"]):
         buttons.append([(f"{i + 1}. {ex['name']}", f"e:ex:{i}")])
     buttons.append([("➕ Добавить упражнение", "e:addex")])
-    row = [("⬅️ К дням", "e:days")]
     if len(state["program"]["days"]) > 1:
-        row.append(("🗑 Удалить день", "e:delday"))
-    buttons.append(row)
+        buttons.append([("🗑 Удалить день", "e:delday")])
+    buttons.append([("💾 Сохранить день", "e:daysave")])
     text = format_day(day) + "\n\nВыберите упражнение или действие:"
     return text, inline_keyboard(buttons)
 
@@ -142,7 +138,6 @@ def screen_exercise(state: dict) -> tuple:
     ex = day["exercises"][index]
     buttons = [
         [("🔢 Изменить подходы", "e:setsedit")],
-        [("🔼 Выше", "e:up"), ("🔽 Ниже", "e:down")],
         [("🗑 Удалить упражнение", "e:delex")],
         [("⬅️ К дню", "e:day")],
     ]
@@ -164,9 +159,11 @@ def screen_rename_day(state: dict) -> tuple:
     return text, inline_keyboard([[("⬅️ Отмена", "e:day")]])
 
 
-def screen_pick_group(state: dict) -> tuple:
+def screen_pick_group(state: dict, my_exercises: list | None = None) -> tuple:
     names = catalog.group_names()
     buttons = []
+    if my_exercises:
+        buttons.append([(f"⭐ Мои упражнения ({len(my_exercises)})", "e:mine")])
     for i in range(0, len(names), 2):
         row = [(names[i], f"e:grp:{i}")]
         if i + 1 < len(names):
@@ -185,16 +182,53 @@ def screen_pick_exercise(group_index: int) -> tuple:
     return f"{catalog.group_name(group_index)} — выберите упражнение:", inline_keyboard(buttons)
 
 
+def screen_my_pick(my_exercises: list) -> tuple:
+    buttons = [[(name, f"e:mex:{i}")] for i, name in enumerate(my_exercises)]
+    buttons.append([("⬅️ К группам", "e:groups"), ("✍️ Своё", "e:own")])
+    return "⭐ Мои упражнения:", inline_keyboard(buttons)
+
+
 def screen_custom_exercise() -> tuple:
     return "Напишите название упражнения:", inline_keyboard([[("⬅️ Отмена", "e:day")]])
 
 
-def screen_sets(title: str) -> tuple:
+# --- личный список упражнений ---
+
+def screen_my_list(my_exercises: list) -> tuple:
+    """Управление личным списком: добавить своё, удалить лишнее."""
+    if my_exercises:
+        lines = ["⭐ Мои упражнения", "", "Нажмите на упражнение, чтобы удалить его из списка:"]
+        buttons = [[(f"🗑 {name}", f"e:mydel:{i}")] for i, name in enumerate(my_exercises)]
+    else:
+        lines = [
+            "⭐ Мои упражнения",
+            "",
+            "Список пуст. Сюда попадают упражнения, которые вы вписали сами "
+            "и отметили «Сохранить в мои упражнения» — их потом можно выбирать "
+            "кнопкой, не набирая заново.",
+        ]
+        buttons = []
+    buttons.append([("➕ Добавить упражнение", "e:myadd")])
+    buttons.append([("⬅️ Назад", "e:days")])
+    return "\n".join(lines), inline_keyboard(buttons)
+
+
+def screen_my_add() -> tuple:
+    return (
+        "Напишите название упражнения, которое добавить в мой список:",
+        inline_keyboard([[("⬅️ Отмена", "e:mylist")]]),
+    )
+
+
+def screen_sets(title: str, is_custom: bool = False, save_to_list: bool = False) -> tuple:
     buttons = [
         [(str(n), f"e:sets:{n}") for n in range(1, 5)],
         [(str(n), f"e:sets:{n}") for n in range(5, 9)],
         [("Другое количество", "e:setsx")],
     ]
+    if is_custom:
+        label = "⭐ Сохранить в мои упражнения: да" if save_to_list else "☆ Сохранить в мои упражнения: нет"
+        buttons.insert(0, [(label, "e:savetoggle")])
     return f"{title}\n\nСколько подходов?", inline_keyboard(buttons)
 
 
