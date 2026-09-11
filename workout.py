@@ -179,6 +179,18 @@ def duration_minutes(state: dict) -> int:
     return int((datetime.now(timezone.utc) - started).total_seconds() // 60)
 
 
+def close_open_exercise(state: dict):
+    """Тренировку можно завершить прямо с экрана ввода веса. Упражнение,
+    в котором уже есть подходы, должно попасть в историю как выполненное,
+    а не остаться в статусе «не начато»."""
+    for entry in state["log"]:
+        if entry["sets"] and entry["status"] == STATUS_PENDING:
+            entry["status"] = STATUS_DONE
+    state["current"] = None
+    state["step"] = STEP_CHOOSE
+    state["pending_weight"] = None
+
+
 def build_summary(state: dict, tz_offset_hours: int = 3) -> str:
     finished_at = datetime.now(timezone.utc).isoformat()
     lines = [
@@ -244,14 +256,10 @@ def screen_weight(state: dict) -> tuple:
     lines.append("Введите вес числом или выберите кнопкой:")
 
     buttons = []
-    quick = []
     previous = last_weight(state)
     if previous:
-        quick.append((f"🔁 {previous:g} кг", f"t:wq:{previous:g}"))
-    for step in (weight_suggestions(previous)):
-        quick.append((f"{step:g}", f"t:wq:{step:g}"))
-    if quick:
-        buttons.append(quick[:4])
+        # только повтор прошлого веса — остальные варианты бот угадать не может
+        buttons.append([(f"🔁 Тот же вес: {previous:g} кг", f"t:wq:{previous:g}")])
     buttons.append([("🤸 Без веса", "t:wq:0")])
     if entry["sets"]:
         buttons.append([("✅ Упражнение выполнено", "t:done")])
@@ -260,13 +268,6 @@ def screen_weight(state: dict) -> tuple:
     buttons.append([("⬅️ К списку упражнений", "t:back")])
     return "\n".join(lines), inline_keyboard(buttons)
 
-
-def weight_suggestions(previous: float | None) -> list:
-    """Соседние веса к прошлому подходу: обычно вес либо тот же, либо ±шаг."""
-    if not previous:
-        return []
-    options = [previous - 5, previous - 2.5, previous + 2.5, previous + 5]
-    return [w for w in options if 0 < w <= MAX_WEIGHT][:3]
 
 
 def screen_reps(state: dict) -> tuple:

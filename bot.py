@@ -111,6 +111,26 @@ class TrainerBot:
                 self._handle_callback(update["callback_query"])
         except Exception:
             log.exception("Ошибка при обработке update: %s", update)
+            self._report_failure(update)
+
+    def _report_failure(self, update: dict):
+        """Если обработка упала, пользователь не должен остаться перед
+        «зависшей» кнопкой: гасим её и честно говорим, что сломалось."""
+        callback = update.get("callback_query") or {}
+        message = update.get("message") or callback.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        try:
+            if callback.get("id"):
+                self.api.answer_callback_query(callback["id"], "Не получилось, попробуйте ещё раз")
+            if chat_id:
+                self.api.send_message(
+                    chat_id,
+                    "⚠️ Что-то пошло не так при обработке этого действия. "
+                    "Попробуйте ещё раз, а если повторится — /cancel и начните заново.",
+                )
+        except Exception:
+            log.exception("Не удалось сообщить пользователю об ошибке")
 
     def _render(self, chat_id: int, state: dict, screen: tuple):
         """Показывает экран: правит уже отправленное сообщение, если возможно,
@@ -819,6 +839,7 @@ class TrainerBot:
             state["msg_id"] = message_id
 
         note = None
+        answered = False
         if data.startswith("w:"):
             if session["state"] != "wizard":
                 note = "Мастер уже закрыт. Начните заново: /newprogram"
@@ -848,7 +869,8 @@ class TrainerBot:
         elif data.startswith("t:"):
             note = self._train_callback(chat_id, user_id, session, state, data, message_id)
 
-        self.api.answer_callback_query(query_id, note)
+        if not answered:
+            self.api.answer_callback_query(query_id, note)
 
     def _train_callback(self, chat_id, user_id, session, state, data, message_id) -> str | None:
         action = data.split(":")[1] if ":" in data else ""
@@ -887,7 +909,14 @@ class TrainerBot:
             return self._begin_workout(chat_id, user_id, int(data.split(":")[2]), message_id)
 
         if session["state"] != "logging":
-            return "Тренировка уже завершена. Начать новую — /train"
+            # Сессия потерялась (например, бот перезапустился без Volume) —
+            # обновляем экран, чтобы не выглядело как сломанная кнопка.
+            self._render(
+                chat_id, state,
+                ("Эта тренировка больше не активна — бот перезапускался или "
+                 "она уже завершена.\n\nНачать новую — /train", None),
+            )
+            return "Тренировка больше не активна"
         return self._workout_callback(chat_id, user_id, state, data)
 
     # ---------- утилиты ----------
@@ -920,7 +949,7 @@ def run_polling():
     trainer = TrainerBot(api, storage, llm_parse)
 
     me = api.get_me()
-    log.info("Бот запущен: @%s", me.get("username"))
+    log.info("Бот запущен: @%s, версия %s", me.get("username"), changelog.VERSION)
     try:
         api.set_my_commands(COMMANDS)
         api.set_chat_menu_button()

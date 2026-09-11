@@ -160,6 +160,64 @@ class BaseBotTest(unittest.TestCase):
             self.click("w:dayend")
 
 
+class CrossModuleTests(unittest.TestCase):
+    """Ловит рассинхронизацию файлов: один модуль зовёт функцию, которой
+    в другом уже (или ещё) нет. Именно так однажды молча сломалась кнопка
+    «Завершить тренировку» — bot.py обновили, а workout.py нет."""
+
+    def test_every_module_call_exists(self):
+        import ast
+        import importlib
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        missing = []
+
+        for filename in sorted(os.listdir(root)):
+            if not filename.endswith(".py"):
+                continue
+            tree = ast.parse(open(os.path.join(root, filename), encoding="utf-8").read())
+
+            # какие модули этот файл импортирует именно как модули
+            imported = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        name = alias.asname or alias.name
+                        try:
+                            imported[name] = importlib.import_module(alias.name)
+                        except ImportError:
+                            pass
+
+            # имена, переопределённые внутри файла, проверять нельзя:
+            # это уже не модуль, а локальная переменная
+            shadowed = {
+                target.id
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.Assign, ast.For))
+                for target in ast.walk(node.targets[0] if isinstance(node, ast.Assign) else node.target)
+                if isinstance(target, ast.Name)
+            }
+            shadowed |= {
+                arg.arg
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                for arg in node.args.args
+            }
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name):
+                    continue
+                name = node.value.id
+                if name not in imported or name in shadowed:
+                    continue
+                if not hasattr(imported[name], node.attr):
+                    missing.append(f"{filename}:{node.lineno} → {name}.{node.attr}")
+
+        self.assertEqual(
+            missing, [], "Вызовы несуществующих функций:\n" + "\n".join(missing)
+        )
+
+
 class MenuTests(unittest.TestCase):
     def test_commands_cover_main_actions(self):
         names = [c for c, _ in COMMANDS]
@@ -618,9 +676,45 @@ class WorkoutTests(BaseBotTest):
         self.send("/train")
         self.assertIn("/newprogram", self.api.screen())
 
-    def test_stale_workout_callback(self):
+    def test_stale_workout_callback_updates_the_screen(self):
+        """После перезапуска бота сессия теряется. Кнопка не должна выглядеть
+        сломанной: экран обновляется, а не просто мигает подсказка."""
+        self.make_program(days=1, exercises_per_day=1)
+        self.send("/train")
+        self.click("t:day:0")
+        self.storage.clear_session(self.user_id)     # как будто бот перезапустился
+
+        self.click("t:finish")
+        self.assertEqual(self.api.last_note(), "Тренировка больше не активна")
+        self.assertIn("больше не активна", self.api.screen())
+        self.assertIn("/train", self.api.screen())
+
+    def test_weight_screen_has_no_guessed_options(self):
+        """Оставили только повтор прошлого веса — угадывать соседние веса лишнее."""
+        self.make_program(days=1, exercises_per_day=1)
+        self.send("/train")
+        self.click("t:day:0")
         self.click("t:ex:0")
-        self.assertEqual(self.api.last_note(), "Тренировка уже завершена. Начать новую — /train")
+        self.send("60")
+        self.send("10")
+        buttons = self.api.buttons()
+        self.assertIn("t:wq:60", buttons)
+        self.assertIn("t:wq:0", buttons)
+        self.assertEqual([b for b in buttons if b.startswith("t:wq:")], ["t:wq:60", "t:wq:0"])
+
+    def test_broken_handler_is_reported_not_silent(self):
+        """Любой сбой должен быть виден: молчащая кнопка выглядит как поломка."""
+        def explode(*args, **kwargs):
+            raise RuntimeError("что-то сломалось внутри")
+
+        self.make_program(days=1, exercises_per_day=1)
+        self.send("/train")
+        self.click("t:day:0")
+        self.bot._finish_workout = explode
+
+        self.click("t:finish")
+        self.assertEqual(self.api.last_note(), "Не получилось, попробуйте ещё раз")
+        self.assertIn("Что-то пошло не так", self.api.screen())
 
 
 def _screen_or_prev(self, needle):
@@ -1042,8 +1136,10 @@ class ChangelogTests(BaseBotTest):
 
     def test_releases_since_comparison(self):
         self.assertEqual(changelog.releases_since(changelog.VERSION), [])
-        self.assertEqual(len(changelog.releases_since("1.3.0")), 1)
-        self.assertEqual(len(changelog.releases_since("0.9.0")), len(changelog.RELEASES))
+        # с предпоследней версии видно ровно одно обновление — последнее
+        previous = changelog.RELEASES[1]["version"]
+        self.assertEqual(changelog.releases_since(previous), changelog.RELEASES[:1])
+        self.assertEqual(len(changelog.releases_since("0.0.1")), len(changelog.RELEASES))
         self.assertEqual(changelog.releases_since("что-то странное"),
                          changelog.RELEASES)   # битую версию считаем самой старой
 
